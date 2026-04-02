@@ -1,0 +1,35 @@
+{
+    "name": "MCP Development - HockeyBot",
+    "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+    "features": {
+        "ghcr.io/devcontainers/features/python:1": {
+            "version": "3.12",
+            "installTools": true
+        },
+        "ghcr.io/devcontainers/features/go:1": {
+            "version": "1.22",
+            "installTools": true
+        },
+        "ghcr.io/devcontainers/features/common-utils:1": {
+            "installZsh": true,
+            "configureZshAsDefaultShell": true
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "golang.go",
+                "ms-azuretools.vscode-docker",
+                "humao.rest-client",
+                "saoudrizwan.claude-dev" 
+            ],
+            "settings": {
+                "python.defaultInterpreterPath": "/usr/local/bin/python",
+                "go.toolsManagement.checkForUpdates": "local",
+                "python.analysis.typeCheckingMode": "basic"
+            }
+        }
+    },
+    "postCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh && pip install 'mcp[cli]'"
+}
