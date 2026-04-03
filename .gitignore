@@ -1,0 +1,10 @@
+.env
+oauth2.json
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+.venv/
