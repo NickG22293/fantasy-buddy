@@ -38,9 +38,23 @@ async def get_player_stats(
         return {"error": f"NHL API error fetching player {player_id}: {e}"}
 
     # Extract current season stats
-    featured = data.get("featuredStats", {}).get("regularSeasonStatsObj", {})
-    season_raw = featured.get("season", {})
-    career_raw = featured.get("career", {})
+    # API structure: featuredStats.regularSeason.subSeason (current season)
+    #                featuredStats.regularSeason.career (career totals)
+    featured_season = data.get("featuredStats", {}).get("regularSeason", {})
+    featured_season_id = data.get("featuredStats", {}).get("season")
+    season_raw = featured_season.get("subSeason", {})
+    career_raw = featured_season.get("career", {})
+
+    # avgToi is absent from subSeason — look it up from seasonTotals
+    toi_per_game = None
+    for entry in data.get("seasonTotals", []):
+        if (
+            entry.get("season") == featured_season_id
+            and entry.get("leagueAbbrev") == "NHL"
+            and entry.get("gameTypeId") == 2
+        ):
+            toi_per_game = entry.get("avgToi")
+            break
 
     season_stats = {
         "games_played": season_raw.get("gamesPlayed"),
@@ -52,7 +66,7 @@ async def get_player_stats(
         "pp_points": season_raw.get("powerPlayPoints"),
         "shots": season_raw.get("shots"),
         "shooting_pct": season_raw.get("shootingPctg"),
-        "toi_per_game": season_raw.get("avgToi"),
+        "toi_per_game": toi_per_game,
     }
 
     career_totals = {

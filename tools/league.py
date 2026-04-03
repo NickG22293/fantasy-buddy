@@ -6,7 +6,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from auth.yahoo_oauth import get_yahoo_session
+from auth.yahoo_session import get_yahoo_session
 
 load_dotenv()
 

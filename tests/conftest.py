@@ -14,8 +14,9 @@ def nhl_player_landing():
         "position": "C",
         "sweaterNumber": 97,
         "featuredStats": {
-            "regularSeasonStatsObj": {
-                "season": {
+            "season": 20242025,
+            "regularSeason": {
+                "subSeason": {
                     "gamesPlayed": 58,
                     "goals": 32,
                     "assists": 62,
@@ -25,7 +26,6 @@ def nhl_player_landing():
                     "powerPlayPoints": 28,
                     "shots": 178,
                     "shootingPctg": 0.180,
-                    "avgToi": "21:34",
                 },
                 "career": {
                     "gamesPlayed": 630,
@@ -33,8 +33,17 @@ def nhl_player_landing():
                     "assists": 678,
                     "points": 990,
                 },
-            }
+            },
         },
+        "seasonTotals": [
+            {
+                "season": 20242025,
+                "leagueAbbrev": "NHL",
+                "gameTypeId": 2,
+                "avgToi": "21:34",
+                "gamesPlayed": 58,
+            }
+        ],
         "last5Games": [
             {
                 "gameDate": "2025-03-20",
