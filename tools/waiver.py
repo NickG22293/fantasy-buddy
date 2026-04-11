@@ -1,229 +1,179 @@
-"""MCP tool: get_waiver_advice — scrape DobberHockey and DailyFaceoff for waiver wire guidance."""
+"""MCP tool: get_waiver_advice — data-driven waiver recommendations via NHL statistical analysis."""
 
-import urllib.parse
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
-from bs4 import BeautifulSoup
+from tools.league import get_league_context
+from tools.stats import get_player_stats
 
-from utils.http import get_scrape_session, rate_limited_get
+# Stat keys used for composite z-score (skaters only — goalie pipeline TBD)
+_SKATER_Z_KEYS = ("goals", "assists", "pp_points", "shots", "toi_per_game")
 
-_DOBBER_WAIVER_URL = "https://dobberhockey.com/category/waiver-wire/"
-_DOBBER_SEARCH_URL = "https://dobberhockey.com/"
-_DAILYFACEOFF_NEWS_URL = "https://www.dailyfaceoff.com/hockey-player-news"
+# Yahoo free_agents() accepts these position codes
+_YAHOO_POSITIONS = {"C", "LW", "RW", "D", "G"}
 
-_ACTION_KEYWORDS: dict[str, list[str]] = {
-    "add": ["add", "pick up", "grab", "target", "recommended add", "must add", "stream"],
-    "drop": ["drop", "cut", "release", "avoid", "don't bother", "do not bother"],
-    "hold": ["hold", "keep", "stash", "rostered", "hold onto"],
-    "watch": ["watch", "monitor", "speculative", "watch list"],
-}
-
-
-def _infer_action(text: str) -> str:
-    lower = text.lower()
-    for action, keywords in _ACTION_KEYWORDS.items():
-        if any(kw in lower for kw in keywords):
-            return action
-    return "unknown"
+# Which eligible_positions values indicate a forward vs. defender
+_FORWARD_ELIGIBLES = {"C", "LW", "RW"}
+_DEFENSE_ELIGIBLES = {"D"}
+_GOALIE_ELIGIBLES = {"G"}
 
 
-def _scrape_dobber_latest(session, position_filter: str | None, top_n: int) -> list[dict]:
-    """Scrape the most recent waiver wire post from DobberHockey."""
+def _yahoo_position(position: str | None) -> str:
+    """Map the requested position to a Yahoo-compatible position code."""
+    if position is None or position.upper() not in _YAHOO_POSITIONS:
+        return "C"  # default: centers as representative skaters
+    return position.upper()
+
+
+def _composite_z(zscores: dict, keys: tuple[str, ...]) -> float | None:
+    """Sum z-scores for the given keys; return None if all are missing."""
+    total = 0.0
+    found = False
+    for k in keys:
+        z = zscores.get(k, {}).get("z")
+        if z is not None:
+            total += z
+            found = True
+    return round(total, 2) if found else None
+
+
+async def _fetch_stats_safe(name: str) -> dict | None:
+    """Fetch NHL stats for a player by name; return None on any failure."""
     try:
-        resp = rate_limited_get(session, _DOBBER_WAIVER_URL, timeout=15)
-    except Exception as e:
-        return [{"error": f"DobberHockey unavailable: {e}"}]
+        result = await get_player_stats(name)
+        return None if "error" in result else result
+    except Exception:
+        return None
 
-    soup = BeautifulSoup(resp.text, "lxml")
-    # Find the first article link in the waiver wire category
-    first_article = soup.select_one("article.post h2.entry-title a, h2.entry-title a")
-    if not first_article:
-        return []
 
-    article_url = first_article.get("href", "")
-    if not article_url:
-        return []
-
-    try:
-        article_resp = rate_limited_get(session, article_url, timeout=15)
-    except Exception as e:
-        return [{"error": f"Failed to fetch DobberHockey article: {e}"}]
-
-    article_soup = BeautifulSoup(article_resp.text, "lxml")
-    content_div = article_soup.select_one("div.entry-content")
-    if not content_div:
-        return []
-
-    players: list[dict] = []
-    for p in content_div.find_all("p"):
-        text = p.get_text(separator=" ", strip=True)
-        if not text or len(text) < 20:
-            continue
-
-        # Player names are often bolded or in the first strong/a tag
-        name_tag = p.find(["strong", "b"])
-        name = name_tag.get_text(strip=True) if name_tag else None
-
-        if not name or len(name) > 40:
-            continue
-
-        action = _infer_action(text)
-        entry = {
+def _score_entry(stats: dict | None, name: str, z_keys: tuple[str, ...], ownership_pct: Any = None) -> dict:
+    if stats is None:
+        return {
             "name": name,
-            "position": None,
             "team": None,
-            "advice": text[:300],
-            "action": action,
-            "source_url": article_url,
-            "published_date": None,
+            "position": None,
+            "composite_z": None,
+            "ownership_pct": ownership_pct,
+            "season_stats": None,
+            "last_5_games": [],
+            "note": "NHL stats unavailable",
         }
-
-        if position_filter and entry["position"] and entry["position"] != position_filter:
-            continue
-
-        players.append(entry)
-        if len(players) >= top_n:
-            break
-
-    return players
-
-
-def _scrape_dobber_player(session, player_name: str) -> dict | None:
-    """Search DobberHockey for a specific player and return their latest mention."""
-    search_url = f"{_DOBBER_SEARCH_URL}?s={urllib.parse.quote(player_name)}"
-    try:
-        resp = rate_limited_get(session, search_url, timeout=15)
-    except Exception:
-        return None
-
-    soup = BeautifulSoup(resp.text, "lxml")
-    first_link = soup.select_one("h2.entry-title a")
-    if not first_link:
-        return None
-
-    article_url = first_link.get("href", "")
-    try:
-        article_resp = rate_limited_get(session, article_url, timeout=15)
-    except Exception:
-        return None
-
-    article_soup = BeautifulSoup(article_resp.text, "lxml")
-    content_div = article_soup.select_one("div.entry-content")
-    if not content_div:
-        return None
-
-    # Find paragraphs mentioning the player
-    name_lower = player_name.lower()
-    for p in content_div.find_all("p"):
-        text = p.get_text(separator=" ", strip=True)
-        if name_lower.split()[-1].lower() in text.lower():
-            return {
-                "name": player_name,
-                "position": None,
-                "team": None,
-                "advice": text[:500],
-                "action": _infer_action(text),
-                "source_url": article_url,
-                "published_date": None,
-            }
-    return None
-
-
-def _scrape_dailyfaceoff_player(session, player_name: str) -> list[dict]:
-    """Fetch recent news items mentioning the player from DailyFaceoff."""
-    try:
-        resp = rate_limited_get(session, _DAILYFACEOFF_NEWS_URL, timeout=15)
-    except Exception:
-        return []
-
-    soup = BeautifulSoup(resp.text, "lxml")
-    results: list[dict] = []
-    name_lower = player_name.lower()
-
-    # DailyFaceoff structures news items in divs with player names
-    for item in soup.select("div.player-news-item, article.news-item, div[class*='news']"):
-        text = item.get_text(separator=" ", strip=True)
-        if name_lower.split()[-1].lower() not in text.lower():
-            continue
-
-        # Try to find a date
-        date_tag = item.find("time")
-        pub_date = date_tag.get("datetime") if date_tag else None
-
-        results.append(
-            {
-                "name": player_name,
-                "position": None,
-                "team": None,
-                "advice": text[:400],
-                "action": _infer_action(text),
-                "source_url": _DAILYFACEOFF_NEWS_URL,
-                "published_date": pub_date,
-            }
-        )
-        if len(results) >= 3:
-            break
-
-    return results
+    return {
+        "name": stats["name"],
+        "team": stats["team"],
+        "position": stats["position"],
+        "composite_z": _composite_z(stats.get("zscores", {}), z_keys),
+        "ownership_pct": ownership_pct,
+        "season_stats": stats["season_stats"],
+        "last_5_games": stats.get("last_5_games", []),
+    }
 
 
 async def get_waiver_advice(
-    player_name: str | None = None,
-    position_filter: str | None = None,
-    top_n: int = 10,
+    position: str | None = None,
+    top_n: int = 20,
 ) -> dict[str, Any]:
     """
-    Scrape DobberHockey and DailyFaceoff for waiver wire guidance.
+    Analyze the top available free agents using NHL statistical data and return
+    data-driven add/drop recommendations for your fantasy roster.
+
+    Internally fetches your league context and NHL stats — no external scraping.
 
     Args:
-        player_name: Optional specific player to look up (searches both sites).
-                     If omitted, returns top waiver adds from the latest article.
-        position_filter: Filter results to a position: "C", "LW", "RW", "D", or "G"
-        top_n: Max players to return when no specific name is given (default 10)
+        position: Position to focus on — "C", "LW", "RW", "D", or "G".
+                  Omit for generic skaters (defaults to Centers).
+        top_n: Number of free agents to evaluate (default 20, max 25).
 
-    Returns a dict with source info, scraped timestamp, and a list of player entries
-    each containing: name, position, team, advice, action, source_url, published_date.
+    Returns ranked free agent add candidates, suggested roster drops to make
+    room, and full ranked lists for both free agents and your current roster
+    at the target position.
     """
-    session = get_scrape_session()
-    scraped_at = datetime.now(timezone.utc).isoformat()
-    players: list[dict] = []
-    errors: list[str] = []
+    top_n = min(top_n, 25)
+    analyzed_at = datetime.now(timezone.utc).isoformat()
+    yahoo_pos = _yahoo_position(position)
+    is_goalie = yahoo_pos == "G"
 
-    if player_name:
-        # Specific player lookup — search both sources
-        dobber_entry = _scrape_dobber_player(session, player_name)
-        if dobber_entry:
-            players.append(dobber_entry)
-        else:
-            errors.append("No DobberHockey mention found for this player")
+    # 1. Fetch league context: roster + top free agents at the target position
+    context = await get_league_context(
+        platform="yahoo",
+        include_free_agents=True,
+        free_agent_position=yahoo_pos,
+    )
+    if "error" in context:
+        return {"error": context["error"], "analyzed_at": analyzed_at}
 
-        dfo_entries = _scrape_dailyfaceoff_player(session, player_name)
-        players.extend(dfo_entries)
-        if not dfo_entries:
-            errors.append("No DailyFaceoff mention found for this player")
+    free_agents = context.get("free_agents", [])[:top_n]
+    roster = context.get("my_roster", [])
 
-        source = "combined" if len(players) > 1 else ("dobberhockey" if players else "none")
+    if not free_agents:
+        return {
+            "error": f"No free agents found for position '{yahoo_pos}'.",
+            "analyzed_at": analyzed_at,
+        }
+
+    # 2. Identify which roster players are in the same position group
+    if is_goalie:
+        roster_targets = [p for p in roster if "G" in p.get("eligible_positions", [])]
+        z_keys: tuple[str, ...] = ()  # goalie z-score pipeline not yet implemented
+    elif yahoo_pos == "D":
+        roster_targets = [p for p in roster if "D" in p.get("eligible_positions", [])]
+        z_keys = _SKATER_Z_KEYS
     else:
-        # General top-adds scrape from DobberHockey
-        dobber_players = _scrape_dobber_latest(session, position_filter, top_n)
-        # Separate actual error dicts from player dicts
-        for entry in dobber_players:
-            if "error" in entry:
-                errors.append(entry["error"])
-            else:
-                players.append(entry)
-        source = "dobberhockey"
+        # Forward position group: eligible for C, LW, or RW but not D
+        roster_targets = [
+            p for p in roster
+            if any(pos in p.get("eligible_positions", []) for pos in _FORWARD_ELIGIBLES)
+            and "D" not in p.get("eligible_positions", [])
+        ]
+        z_keys = _SKATER_Z_KEYS
 
-    result: dict[str, Any] = {
-        "source": source,
-        "scraped_at": scraped_at,
-        "players": players,
+    # 3. Fetch NHL stats concurrently for all FAs and relevant roster players
+    fa_names = [p["name"] for p in free_agents]
+    roster_names = [p["name"] for p in roster_targets]
+
+    fa_stats, roster_stats = await asyncio.gather(
+        asyncio.gather(*[_fetch_stats_safe(n) for n in fa_names]),
+        asyncio.gather(*[_fetch_stats_safe(n) for n in roster_names]),
+    )
+
+    fa_ownership = {p["name"]: p.get("ownership_pct") for p in free_agents}
+
+    # 4. Score each player by composite z-score
+    scored_fas = [
+        _score_entry(stats, name, z_keys, fa_ownership.get(name))
+        for name, stats in zip(fa_names, fa_stats)
+    ]
+    scored_roster = [
+        _score_entry(stats, name, z_keys)
+        for name, stats in zip(roster_names, roster_stats)
+    ]
+
+    # 5. Rank: FAs highest z first; roster lowest z first (weakest links)
+    ranked_fas = sorted(
+        [p for p in scored_fas if p["composite_z"] is not None],
+        key=lambda p: p["composite_z"],
+        reverse=True,
+    )
+    ranked_roster = sorted(
+        [p for p in scored_roster if p["composite_z"] is not None],
+        key=lambda p: p["composite_z"],
+    )
+
+    # Top 5 adds; drop candidates only where a top FA is statistically better
+    add_candidates = ranked_fas[:5]
+    drop_candidates = [
+        p for p in ranked_roster[:3]
+        if add_candidates and add_candidates[0]["composite_z"] > (p["composite_z"] or 0)
+    ]
+
+    return {
+        "analyzed_at": analyzed_at,
+        "position_group": yahoo_pos,
+        "league_name": context.get("league_name"),
+        "current_week": context.get("current_week"),
+        "add_candidates": add_candidates,
+        "drop_candidates": drop_candidates,
+        "all_free_agents_ranked": ranked_fas,
+        "roster_ranked_weakest_first": ranked_roster,
     }
-
-    if errors and not players:
-        result["error"] = "; ".join(errors) + " — sites may be temporarily unavailable"
-    elif errors:
-        result["warnings"] = errors
-
-    return result

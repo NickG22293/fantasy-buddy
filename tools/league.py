@@ -6,7 +6,8 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from auth.yahoo_session import get_yahoo_session
+from auth.context import current_user
+from auth.yahoo_session import YahooSession
 
 load_dotenv()
 
@@ -32,13 +33,33 @@ def _format_free_agent(p: dict) -> dict:
     }
 
 
-def _yahoo_league_context(league_id: str, week: int | None, include_free_agents: bool, free_agent_position: str | None) -> dict:
+def _yahoo_league_context(user: dict, league_id: str, week: int | None, include_free_agents: bool, free_agent_position: str | None) -> dict:
     """Synchronous Yahoo Fantasy API call — run via asyncio.to_thread."""
     import yahoo_fantasy_api as yfa
 
-    sc = get_yahoo_session()
+    sc = YahooSession(user)
     gm = yfa.Game(sc, "nhl")
-    lg = gm.to_league(league_id)
+
+    # league_ids() returns full keys like "465.l.26058"; the env var may be
+    # just the numeric part ("26058") or already the full key.
+    available_ids = gm.league_ids(year=2025)
+    if not available_ids:
+        raise RuntimeError("No NHL leagues found for year 2025 on this Yahoo account.")
+
+    if "." in league_id:
+        # Already a full key — use directly if present, else fall back to first
+        full_league_id = league_id if league_id in available_ids else available_ids[0]
+    else:
+        # Numeric-only ID: find the matching full key
+        matching = [lid for lid in available_ids if lid.endswith(f".l.{league_id}")]
+        if not matching:
+            raise RuntimeError(
+                f"League ID '{league_id}' not found among Yahoo leagues: {available_ids}. "
+                "Check YAHOO_LEAGUE_ID in .env."
+            )
+        full_league_id = matching[0]
+
+    lg = gm.to_league(full_league_id)
 
     current_week = week or lg.current_week()
     week_start, week_end = lg.week_date_range(current_week)
@@ -121,6 +142,118 @@ def _espn_league_context(league_id: str, season_year: int | None, include_free_a
     }
 
 
+def _resolve_yahoo_league_id(gm: object, league_id: str) -> str:
+    """Resolve a league_id (full key or numeric) to a full Yahoo league key."""
+    available_ids = gm.league_ids(year=2025)
+    if not available_ids:
+        raise RuntimeError("No NHL leagues found for year 2025 on this Yahoo account.")
+    if "." in league_id:
+        return league_id if league_id in available_ids else available_ids[0]
+    matching = [lid for lid in available_ids if lid.endswith(f".l.{league_id}")]
+    if not matching:
+        raise RuntimeError(
+            f"League ID '{league_id}' not found among Yahoo leagues: {available_ids}. "
+            "Check YAHOO_LEAGUE_ID in .env."
+        )
+    return matching[0]
+
+
+def _yahoo_trade_context(user: dict, league_id: str, opponent: str, week: int | None) -> dict:
+    """Synchronous Yahoo Fantasy API call — fetches my roster and a named opponent's roster."""
+    import yahoo_fantasy_api as yfa
+
+    sc = YahooSession(user)
+    gm = yfa.Game(sc, "nhl")
+    full_league_id = _resolve_yahoo_league_id(gm, league_id)
+
+    lg = gm.to_league(full_league_id)
+    current_week = week or lg.current_week()
+    settings = lg.settings()
+
+    my_team_key = lg.team_key()
+    all_teams: dict = lg.teams()  # keyed by team_key
+
+    # Match opponent by exact team_key or case-insensitive name substring
+    opp_key: str | None = None
+    opp_name: str | None = None
+    for team_key, team_data in all_teams.items():
+        if team_key == my_team_key:
+            continue
+        name = team_data.get("name", "")
+        if team_key == opponent or opponent.lower() in name.lower():
+            opp_key = team_key
+            opp_name = name
+            break
+
+    if not opp_key:
+        available = [
+            {"team_key": k, "name": v.get("name")}
+            for k, v in all_teams.items()
+            if k != my_team_key
+        ]
+        raise RuntimeError(
+            f"Could not find opponent '{opponent}'. Available teams: {available}"
+        )
+
+    my_roster_raw = lg.to_team(my_team_key).roster(current_week)
+    opp_roster_raw = lg.to_team(opp_key).roster(current_week)
+
+    return {
+        "platform": "yahoo",
+        "league_name": settings.get("name", "Unknown"),
+        "current_week": current_week,
+        "my_team_key": my_team_key,
+        "my_roster": [_format_roster_player(p) for p in my_roster_raw],
+        "opponent_team_key": opp_key,
+        "opponent_name": opp_name,
+        "opponent_roster": [_format_roster_player(p) for p in opp_roster_raw],
+    }
+
+
+async def get_trade_context(
+    opponent: str,
+    platform: str = "yahoo",
+    league_id: str | None = None,
+    week: int | None = None,
+) -> dict[str, Any]:
+    """
+    Retrieve roster data for both your team and an opponent's team.
+
+    Args:
+        opponent: Opponent's team name (partial match OK) or Yahoo team key
+        platform: Fantasy platform — only "yahoo" is currently supported
+        league_id: League ID (overrides user profile if provided)
+        week: Scoring week number (None = current week)
+
+    Returns both rosters formatted for trade analysis.
+    """
+    if platform != "yahoo":
+        return {"error": f"Trade context only supports 'yahoo' platform, not '{platform}'."}
+
+    user = current_user.get()
+    if not user:
+        return {"error": "Not authenticated. Complete Yahoo OAuth at the HockeyBot web UI."}
+
+    resolved_league_id = league_id or user.get("league_id") or os.environ.get("YAHOO_LEAGUE_ID")
+    if not resolved_league_id:
+        return {"error": "No league configured. Visit the HockeyBot web UI to select your league."}
+
+    try:
+        result = await asyncio.to_thread(
+            _yahoo_trade_context,
+            user,
+            resolved_league_id,
+            opponent,
+            week,
+        )
+    except RuntimeError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": f"Trade context fetch failed: {e}"}
+
+    return result
+
+
 async def get_league_context(
     platform: str = "yahoo",
     league_id: str | None = None,
@@ -140,14 +273,21 @@ async def get_league_context(
 
     Returns your current roster, available free agents, league name, and current week info.
     """
-    resolved_league_id = league_id or os.environ.get(
-        "YAHOO_LEAGUE_ID" if platform == "yahoo" else "ESPN_LEAGUE_ID"
-    )
+    if platform == "yahoo":
+        user = current_user.get()
+        if not user:
+            return {"error": "Not authenticated. Complete Yahoo OAuth at the HockeyBot web UI."}
+        resolved_league_id = league_id or user.get("league_id") or os.environ.get("YAHOO_LEAGUE_ID")
+    else:
+        user = None
+        resolved_league_id = league_id or os.environ.get("ESPN_LEAGUE_ID")
+
     if not resolved_league_id:
         return {
             "error": (
-                f"No league_id provided and {'YAHOO_LEAGUE_ID' if platform == 'yahoo' else 'ESPN_LEAGUE_ID'} "
-                "is not set in .env"
+                "No league configured. "
+                + ("Visit the HockeyBot web UI to select your league." if platform == "yahoo"
+                   else "ESPN_LEAGUE_ID is not set in .env")
             )
         }
 
@@ -155,6 +295,7 @@ async def get_league_context(
         if platform == "yahoo":
             result = await asyncio.to_thread(
                 _yahoo_league_context,
+                user,
                 resolved_league_id,
                 week,
                 include_free_agents,

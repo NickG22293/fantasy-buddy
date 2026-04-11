@@ -10,6 +10,7 @@
             "version": "1.22",
             "installTools": true
         },
+        "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {},
         "ghcr.io/devcontainers/features/common-utils:1": {
             "installZsh": true,
             "configureZshAsDefaultShell": true
@@ -31,5 +32,6 @@
             }
         }
     },
+    "runArgs": ["--network=host"],
     "postCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh && pip install 'mcp[cli]'"
 }
