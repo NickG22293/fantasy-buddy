@@ -1,49 +1,37 @@
 """
 Yahoo OAuth2 route handlers — multi-user auth flow for the HockeyBot web server.
 
-Flow:
+Flow (web UI):
   /auth/login      → redirect to Yahoo consent screen
   /auth/callback   → exchange code for tokens, create/update user in DB
   /auth/setup      → user picks their Yahoo NHL league
   /auth/success    → show API key + MCP client config snippet
+
+Flow (MCP OAuth — initiated by MCP SDK hitting /authorize):
+  /authorize (FastMCP) → /auth/callback (via Yahoo) → MCP SDK redirect_uri
 """
 
 import asyncio
-import base64
-import os
-import time
+import secrets
 
-import yahoo_fantasy_api as yfa
-from rauth import OAuth2Service
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse
 
 from auth.db import get_user_by_id, update_user_league, upsert_user
+from auth.oauth_provider import (
+    BASE_URL,
+    CALLBACK_URL,
+    USE_SSL,
+    _CERT_FILE,
+    _KEY_FILE,
+    _PORT,
+    _SCHEME,
+    yahoo_oauth_service,
+)
 from auth.yahoo_session import YahooSession
 
-YAHOO_AUTHORIZE_URL = "https://api.login.yahoo.com/oauth2/request_auth"
-YAHOO_ACCESS_TOKEN_URL = "https://api.login.yahoo.com/oauth2/get_token"
-
-_PORT = int(os.environ.get("AUTH_SERVER_PORT", 8000))
-_CERT_FILE = os.path.join(os.path.dirname(__file__), "localhost.crt")
-_KEY_FILE = os.path.join(os.path.dirname(__file__), "localhost.key")
-USE_SSL = os.path.exists(_CERT_FILE) and os.path.exists(_KEY_FILE)
-_SCHEME = "https" if USE_SSL else "http"
-CALLBACK_URL = f"{_SCHEME}://localhost:{_PORT}/auth/callback"
-
-
-def _oauth_service() -> OAuth2Service:
-    client_id = os.environ.get("YAHOO_CLIENT_ID", "")
-    client_secret = os.environ.get("YAHOO_CLIENT_SECRET", "")
-    if not client_id or not client_secret:
-        raise RuntimeError("YAHOO_CLIENT_ID and YAHOO_CLIENT_SECRET must be set in .env")
-    return OAuth2Service(
-        client_id=client_id,
-        client_secret=client_secret,
-        name="yahoo",
-        authorize_url=YAHOO_AUTHORIZE_URL,
-        access_token_url=YAHOO_ACCESS_TOKEN_URL,
-    )
+# Legacy aliases so server.py keeps working unchanged
+_oauth_service = yahoo_oauth_service
 
 
 # ── Route handlers ────────────────────────────────────────────────────────────
@@ -56,7 +44,7 @@ async def homepage(request: Request) -> HTMLResponse:
         body = f"""
         <div class="status authenticated"><span class="dot"></span>Connected as {user['yahoo_guid']}</div>
         {"<p>League: <strong>" + user['league_id'] + "</strong></p>" if user.get('league_id') else '<p><a href="/auth/setup">Pick your league →</a></p>'}
-        <p><a href="/auth/success">View API key & MCP config</a></p>
+        <p><a href="/auth/success">View API key &amp; MCP config</a></p>
         """
     else:
         body = """
@@ -68,10 +56,13 @@ async def homepage(request: Request) -> HTMLResponse:
 
 
 async def login(request: Request) -> RedirectResponse:
-    import secrets
-    state = secrets.token_urlsafe(16)
+    csrf = secrets.token_urlsafe(16)
+    nonce = request.query_params.get("nonce", "")
+    # Encode both csrf and optional MCP nonce into the state param.
+    # Format: "{csrf}|{nonce}" — "|" is safe since token_urlsafe uses only [-_A-Za-z0-9].
+    state = f"{csrf}|{nonce}" if nonce else csrf
     request.session["oauth_state"] = state
-    auth_url = _oauth_service().get_authorize_url(
+    auth_url = yahoo_oauth_service().get_authorize_url(
         redirect_uri=CALLBACK_URL,
         response_type="code",
         state=state,
@@ -81,21 +72,57 @@ async def login(request: Request) -> RedirectResponse:
 
 
 async def callback(request: Request) -> HTMLResponse | RedirectResponse:
+    import base64
+    import time
+
+    import requests as _requests
+
     error = request.query_params.get("error")
     if error:
         return _error_page(f"Yahoo returned an error: {error}")
 
-    returned_state = request.query_params.get("state")
+    returned_state = request.query_params.get("state", "")
     expected_state = request.session.pop("oauth_state", None)
-    if returned_state != expected_state:
-        return _error_page("State mismatch — possible CSRF. Please try again.")
+
+    # MCP OAuth flow bypasses the session-based CSRF check (the /authorize handler
+    # stores its own nonce; we validate via the pending dict in the provider).
+    mcp_nonce: str | None = None
+    if "|" in returned_state:
+        csrf_part, rest = returned_state.split("|", 1)
+        if rest.startswith("mcp:"):
+            mcp_nonce = rest[4:]  # MCP OAuth flow — nonce validated by provider
+        else:
+            # Web UI tool-based flow — normal CSRF check applies
+            if returned_state != expected_state:
+                return _error_page("State mismatch — possible CSRF. Please try again.")
+            mcp_nonce = rest or None  # plain tool nonce
+    else:
+        if returned_state != expected_state:
+            return _error_page("State mismatch — possible CSRF. Please try again.")
 
     code = request.query_params.get("code")
     if not code:
         return _error_page("No authorization code returned by Yahoo.")
 
-    client_id = os.environ.get("YAHOO_CLIENT_ID", "")
-    client_secret = os.environ.get("YAHOO_CLIENT_SECRET", "")
+    # ── MCP OAuth flow: delegate entirely to the provider ─────────────────────
+    if mcp_nonce and mcp_nonce:
+        from auth import oauth_provider as _op
+        if mcp_nonce.startswith("mcp:") or True:  # already stripped above
+            prov = _op.provider
+            if prov is not None:
+                try:
+                    redirect_url = await asyncio.to_thread(
+                        prov.complete_mcp_auth, mcp_nonce, code, returned_state
+                    )
+                except Exception as e:
+                    return _error_page(f"MCP OAuth error: {e}")
+                if redirect_url:
+                    return RedirectResponse(redirect_url, status_code=302)
+                return _error_page("MCP OAuth flow expired or unknown. Please try again.")
+
+    # ── Web UI flow: exchange code ourselves ───────────────────────────────────
+    client_id = __import__("os").environ.get("YAHOO_CLIENT_ID", "")
+    client_secret = __import__("os").environ.get("YAHOO_CLIENT_SECRET", "")
     encoded = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     headers = {
         "Authorization": f"Basic {encoded}",
@@ -103,7 +130,7 @@ async def callback(request: Request) -> HTMLResponse | RedirectResponse:
     }
 
     try:
-        raw = _oauth_service().get_raw_access_token(
+        raw = yahoo_oauth_service().get_raw_access_token(
             data={"code": code, "redirect_uri": CALLBACK_URL, "grant_type": "authorization_code"},
             headers=headers,
         )
@@ -116,9 +143,7 @@ async def callback(request: Request) -> HTMLResponse | RedirectResponse:
 
     yahoo_guid = token_data.get("xoauth_yahoo_guid") or token_data.get("yahoo_guid")
     if not yahoo_guid:
-        # Fall back to Fantasy API — returns current user's GUID with fspt-r scope
         try:
-            import requests as _requests
             resp = _requests.get(
                 "https://fantasysports.yahooapis.com/fantasy/v2/users;use_login=1",
                 headers={"Authorization": f"Bearer {token_data['access_token']}"},
@@ -137,6 +162,11 @@ async def callback(request: Request) -> HTMLResponse | RedirectResponse:
         token_time=time.time(),
     )
     request.session["user_id"] = user["id"]
+
+    # Resolve tool-based MCP auth nonce (authenticate tool flow)
+    if mcp_nonce:
+        from auth.pending import resolve as resolve_pending
+        resolve_pending(mcp_nonce, user)
 
     return RedirectResponse("/auth/setup", status_code=302)
 
@@ -168,12 +198,13 @@ async def setup_page(request: Request) -> HTMLResponse | RedirectResponse:
         error_note = ""
 
     if leagues:
-        options = "\n".join(
-            f'<label><input type="radio" name="league_id" value="{lg["id"]}" '
-            f'{"checked" if user.get("league_id") == lg["id"] else ""}> '
-            f'{lg["name"]} <small>({lg["id"]})</small></label><br>'
-            for lg in leagues
-        )
+        def _option(lg: dict) -> str:
+            checked = "checked" if user.get("league_id") == lg["id"] else ""
+            return (
+                f'<label><input type="radio" name="league_id" value="{lg["id"]}" {checked}> '
+                f'{lg["name"]} <small>({lg["id"]})</small></label><br>'
+            )
+        options = "\n".join(_option(lg) for lg in leagues)
         form_body = f"""
         <form method="post">
           <fieldset>
@@ -206,7 +237,7 @@ async def success(request: Request) -> HTMLResponse | RedirectResponse:
     if not user:
         return RedirectResponse("/auth/login", status_code=302)
 
-    mcp_url = f"{_SCHEME}://localhost:{_PORT}/mcp?token={user['api_key']}"
+    mcp_url = f"{BASE_URL}/mcp"
     config_json = (
         '{\n'
         '  "mcpServers": {\n'
@@ -220,9 +251,10 @@ async def success(request: Request) -> HTMLResponse | RedirectResponse:
 
     body = f"""
     <h2>You're all set!</h2>
-    <p>Add this to your Claude Desktop <code>claude_desktop_config.json</code>:</p>
+    <p>Add this to your Claude Desktop or Claude Code <code>mcp config</code>:</p>
     <pre>{config_json}</pre>
-    <p><strong>Your API key:</strong> <code>{user['api_key']}</code></p>
+    <p>The first time you connect, Claude will open a browser window to authenticate.</p>
+    <p><strong>Your API key (for manual use):</strong> <code>{user['api_key']}</code></p>
     <p style="color:#64748b;font-size:0.875rem;">Keep this key private — it grants access to your fantasy data.</p>
     <p><a href="/">← Back</a></p>
     """
@@ -233,6 +265,7 @@ async def success(request: Request) -> HTMLResponse | RedirectResponse:
 
 def _fetch_yahoo_leagues(user: dict) -> list[dict]:
     """Synchronous — call via asyncio.to_thread. Returns list of {id, name}."""
+    import yahoo_fantasy_api as yfa
     sc = YahooSession(user)
     gm = yfa.Game(sc, "nhl")
     ids = gm.league_ids(year=2025)

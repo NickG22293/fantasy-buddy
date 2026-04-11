@@ -33,5 +33,5 @@
         }
     },
     "runArgs": ["--network=host"],
-    "postCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh && pip install 'mcp[cli]'"
+    "postCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh && pip install 'mcp[cli]' && ([ -f /workspaces/fantasy/auth/localhost.crt ] || bash /workspaces/fantasy/auth/gen_cert.sh) && sudo cp /workspaces/fantasy/auth/localhost.crt /usr/local/share/ca-certificates/hockeybot-localhost.crt && sudo update-ca-certificates"
 }

@@ -6,7 +6,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from auth.context import current_user
+from auth.context import get_current_user
 from auth.yahoo_session import YahooSession
 
 load_dotenv()
@@ -230,13 +230,13 @@ async def get_trade_context(
     if platform != "yahoo":
         return {"error": f"Trade context only supports 'yahoo' platform, not '{platform}'."}
 
-    user = current_user.get()
+    user = get_current_user()
     if not user:
-        return {"error": "Not authenticated. Complete Yahoo OAuth at the HockeyBot web UI."}
+        return {"error": "Not authenticated. Call the `authenticate` tool to connect your Yahoo account."}
 
     resolved_league_id = league_id or user.get("league_id") or os.environ.get("YAHOO_LEAGUE_ID")
     if not resolved_league_id:
-        return {"error": "No league configured. Visit the HockeyBot web UI to select your league."}
+        return {"error": "No league configured. Visit the HockeyBot setup page or ask me to set it once you have the league ID."}
 
     try:
         result = await asyncio.to_thread(
@@ -274,9 +274,9 @@ async def get_league_context(
     Returns your current roster, available free agents, league name, and current week info.
     """
     if platform == "yahoo":
-        user = current_user.get()
+        user = get_current_user()
         if not user:
-            return {"error": "Not authenticated. Complete Yahoo OAuth at the HockeyBot web UI."}
+            return {"error": "Not authenticated. Call the `authenticate` tool to connect your Yahoo account."}
         resolved_league_id = league_id or user.get("league_id") or os.environ.get("YAHOO_LEAGUE_ID")
     else:
         user = None
@@ -286,7 +286,7 @@ async def get_league_context(
         return {
             "error": (
                 "No league configured. "
-                + ("Visit the HockeyBot web UI to select your league." if platform == "yahoo"
+                + ("Visit the HockeyBot setup page or ask me to set it once you have the league ID." if platform == "yahoo"
                    else "ESPN_LEAGUE_ID is not set in .env")
             )
         }

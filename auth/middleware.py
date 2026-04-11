@@ -39,14 +39,13 @@ class APIKeyMiddleware:
             qs = parse_qs(scope.get("query_string", b"").decode())
             api_key = qs.get("token", [None])[0]
 
-        if not api_key:
-            await _unauthorized("Missing API key. Add ?token=<key> or Authorization: Bearer <key>.", scope, send)
-            return
-
-        user = get_user_by_api_key(api_key)
-        if not user:
-            await _unauthorized("Invalid API key.", scope, send)
-            return
+        if api_key:
+            user = get_user_by_api_key(api_key)
+            if not user:
+                await _unauthorized("Invalid API key.", scope, send)
+                return
+        else:
+            user = None
 
         token = current_user.set(user)
         try:

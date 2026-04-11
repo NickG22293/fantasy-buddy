@@ -4,8 +4,6 @@ __pycache__/
 *.pyo
 .env
 hockeybot.db
-auth/localhost.crt
-auth/localhost.key
 .git/
 .pytest_cache/
 .ruff_cache/

@@ -1,7 +1,5 @@
 .env
 oauth2.json
-auth/localhost.crt
-auth/localhost.key
 hockeybot.db
 __pycache__/
 *.pyc
@@ -11,3 +9,6 @@ __pycache__/
 dist/
 *.egg-info/
 .venv/
+
+auth/*.crt
+auth/*.key

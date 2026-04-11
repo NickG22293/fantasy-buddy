@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hockey-bot": {
+      "type": "http",
+      "url": "https://localhost:8000/mcp"
+    }
+  }
+}

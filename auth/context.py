@@ -1,8 +1,17 @@
-"""Per-request user context — set by APIKeyMiddleware, read by tools."""
+"""Per-request user context — populated by FastMCP's BearerAuthMiddleware."""
 
-from contextvars import ContextVar
+from mcp.server.auth.middleware.auth_context import get_access_token
 
-# Holds the current authenticated user dict (from DB) for the duration of a request.
-# None when no user is authenticated (e.g. unauthenticated requests will be rejected
-# before tools are called).
-current_user: ContextVar[dict | None] = ContextVar("current_user", default=None)
+from auth.db import get_user_by_id
+
+
+def get_current_user() -> dict | None:
+    """Return the authenticated user dict for the current request, or None."""
+    token = get_access_token()
+    if token is None:
+        return None
+    try:
+        user_id = int(token.client_id)
+    except (TypeError, ValueError):
+        return None
+    return get_user_by_id(user_id)
