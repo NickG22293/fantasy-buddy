@@ -1,0 +1,6 @@
+apiVersion: v2
+name: hockeybot
+description: HockeyBot MCP Server — Fantasy hockey roster advisor powered by NHL and Yahoo Fantasy APIs
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

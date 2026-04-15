@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-env
+  labels:
+    {{- include "hockeybot.labels" . | nindent 4 }}
+data:
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  REQUESTS_CA_BUNDLE: {{ .Values.config.requestsCaBundle | quote }}
+  SSL_CERT_FILE: {{ .Values.config.sslCertFile | quote }}
+  YAHOO_LEAGUE_ID: {{ .Values.config.yahooLeagueId | quote }}
+  YAHOO_OAUTH_CREDS_FILE: {{ .Values.config.yahooOauthCredsFile | quote }}

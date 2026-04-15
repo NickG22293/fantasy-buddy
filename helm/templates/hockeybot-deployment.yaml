@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-hockeybot
+  labels:
+    {{- include "hockeybot.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "hockeybot.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "hockeybot.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: hockeybot
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          env:
+            - name: DB_PATH
+              value: {{ .Values.config.dbPath | quote }}
+          envFrom:
+            - configMapRef:
+                name: {{ .Release.Name }}-env
+            - secretRef:
+                name: {{ .Release.Name }}-credentials
+          volumeMounts:
+            - mountPath: /data
+              name: db-data
+      restartPolicy: Always
+      volumes:
+        - name: db-data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-db-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}

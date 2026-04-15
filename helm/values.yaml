@@ -1,0 +1,29 @@
+replicaCount: 1
+
+image:
+  repository: hockeybot
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  port: 8000
+
+persistence:
+  enabled: true
+  size: 100Mi
+  accessMode: ReadWriteOnce
+  # storageClassName: ""
+
+config:
+  logLevel: INFO
+  dbPath: /data/hockeybot.db
+  requestsCaBundle: /etc/ssl/certs/ca-certificates.crt
+  sslCertFile: /etc/ssl/certs/ca-certificates.crt
+  yahooLeagueId: "26058"
+  yahooOauthCredsFile: oauth2.json
+
+# Sensitive credentials — do NOT commit real values here.
+# Override via: --set secrets.yahooClientId=... or an external secret manager.
+secrets:
+  yahooClientId: ""
+  yahooClientSecret: ""
